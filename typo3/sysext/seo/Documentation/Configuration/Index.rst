@@ -137,6 +137,15 @@ You just have to put this line in the :file:`ext_localconf.php` of an extension 
 
    unset($GLOBALS['TYPO3_CONF_VARS']['SC_OPTIONS']['TYPO3\CMS\Frontend\Page\PageGenerator']['generateMetaTags']['canonical']);
 
+Please note that the CanonicalGenerator performs 2 different checks to determine the canonical url before falling back to the default hehavior:
+
+1) It checks if a canonical url is set on the current page record
+2) It checks if the current page shows content from another page and checks if that page record has a canocical url set
+
+If none of those 2 checks result in a proper url, it is tried to determine the canonical url from the site configuration. During that process,
+the CanonicalGenerator checks the rootline of the current page and it expects to find a page which has `is_siteroot` set. Even on single domain
+sites, this flag is necessary. If not set, the SEO extension will not generate a canonical tag.
+
 Working links
 =============
 
