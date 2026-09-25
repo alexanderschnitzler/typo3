@@ -603,7 +603,7 @@ class Backend implements BackendInterface
 
         $uid = $this->storageBackend->addRow($dataMap->tableName, $row);
         $localizedUid = $object->_getProperty(AbstractDomainObject::PROPERTY_LOCALIZED_UID);
-        $identifier = $this->session->buildIdentifier(['uid' => $uid, '_LOCALIZED_UID' => $localizedUid]);
+        $identifier = (string)EntityIdentity::fromRow(['uid' => $uid, '_LOCALIZED_UID' => $localizedUid]);
         $object->_setProperty(AbstractDomainObject::PROPERTY_UID, $uid);
         $object->setPid((int)$row['pid']);
         if ($uid >= 1) {

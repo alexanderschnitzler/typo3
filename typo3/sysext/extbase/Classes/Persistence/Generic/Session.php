@@ -166,39 +166,15 @@ class Session
     /**
      * Build a language-aware identifier for the identity map by combining
      * a base identifier with a language content identifier.
+     *
+     * @see EntityIdentity
      */
     public function buildIdentifier(string|array $baseIdentifier, ?LanguageAspect $languageAspect = null): string
     {
-        if (is_array($baseIdentifier)) {
-            $identifier = (string)$baseIdentifier['uid'];
-            if (isset($baseIdentifier['_LOCALIZED_UID'])) {
-                $identifier .= '_' . $baseIdentifier['_LOCALIZED_UID'];
-            }
-            $baseIdentifier = $identifier;
-        }
-        // Use default language context for newly inserted objects
-        $languageAspect ??= new LanguageAspect(0, 0, LanguageAspect::OVERLAYS_ON_WITH_FLOATING, []);
-        return $baseIdentifier . '@' . $this->getContentIdentifier($languageAspect);
-    }
-
-    /**
-     * Build a unique identifier representing the content-fetching configuration
-     * of the given LanguageAspect.
-     *
-     * This includes contentId, overlayType, and fallbackChain — everything
-     * that affects which record overlay is returned. The language ID is
-     * intentionally excluded because it only affects menus/links, not content.
-     *
-     * @internal
-     */
-    protected function getContentIdentifier(LanguageAspect $languageAspect): string
-    {
-        return sprintf(
-            '%d-%s-%s',
-            $languageAspect->getContentId(),
-            $languageAspect->getOverlayType(),
-            implode(',', $languageAspect->getFallbackChain())
-        );
+        $identity = is_array($baseIdentifier)
+            ? EntityIdentity::fromRow($baseIdentifier, $languageAspect)
+            : EntityIdentity::fromBaseIdentifier($baseIdentifier, $languageAspect);
+        return (string)$identity;
     }
 
     /**
@@ -206,10 +182,6 @@ class Session
      */
     public function getBaseIdentifier(string $identifier): string
     {
-        $pos = strpos($identifier, '@');
-        if ($pos !== false) {
-            return substr($identifier, 0, $pos);
-        }
-        return $identifier;
+        return EntityIdentity::baseIdentifierOf($identifier);
     }
 }
