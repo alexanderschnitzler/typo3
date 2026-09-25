@@ -21,14 +21,12 @@ use Doctrine\DBAL\ArrayParameterType;
 use Doctrine\DBAL\ParameterType;
 use Doctrine\DBAL\Platforms\PostgreSQLPlatform;
 use Doctrine\DBAL\Types\Type;
-use Psr\Http\Message\ServerRequestInterface;
 use Symfony\Component\DependencyInjection\Attribute\Autoconfigure;
 use TYPO3\CMS\Core\Database\Connection;
 use TYPO3\CMS\Core\Database\ConnectionPool;
 use TYPO3\CMS\Core\Database\Query\Expression\CompositeExpression;
 use TYPO3\CMS\Core\Database\Query\Expression\ExpressionBuilder;
 use TYPO3\CMS\Core\Database\Query\QueryBuilder;
-use TYPO3\CMS\Core\Http\ApplicationType;
 use TYPO3\CMS\Core\Schema\TcaSchemaFactory;
 use TYPO3\CMS\Extbase\DomainObject\AbstractDomainObject;
 use TYPO3\CMS\Extbase\DomainObject\DomainObjectInterface;
@@ -638,7 +636,6 @@ class Typo3DbQueryParser
                 $tableName,
                 $tableAlias,
                 $querySettings,
-                fn(string $alias): string => $this->getVisibilityConstraintStatement($querySettings, $tableName, $alias),
             );
             if (!empty($systemLanguageStatement)) {
                 $whereClause[] = $systemLanguageStatement;
@@ -664,16 +661,7 @@ class Typo3DbQueryParser
      */
     protected function getVisibilityConstraintStatement(QuerySettingsInterface $querySettings, string $tableName, string $tableAlias): string
     {
-        if (!$this->tcaSchemaFactory->has($tableName)) {
-            return '';
-        }
-        return $this->visibilityPredicate->build($querySettings, $tableName, $tableAlias, $this->isFrontendRequest());
-    }
-
-    protected function isFrontendRequest(): bool
-    {
-        return ($GLOBALS['TYPO3_REQUEST'] ?? null) instanceof ServerRequestInterface
-            && ApplicationType::fromRequest($GLOBALS['TYPO3_REQUEST'])->isFrontend();
+        return $this->visibilityPredicate->build($querySettings, $tableName, $tableAlias);
     }
 
     /**

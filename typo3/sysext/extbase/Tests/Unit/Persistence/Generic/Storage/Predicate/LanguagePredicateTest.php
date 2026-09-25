@@ -20,10 +20,13 @@ namespace TYPO3\CMS\Extbase\Tests\Unit\Persistence\Generic\Storage\Predicate;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use TYPO3\CMS\Core\Context\LanguageAspect;
+use TYPO3\CMS\Core\Database\ConnectionPool;
 use TYPO3\CMS\Core\Database\Query\QueryBuilder;
 use TYPO3\CMS\Core\Database\Query\Restriction\QueryRestrictionContainerInterface;
-use TYPO3\CMS\Extbase\Persistence\Generic\QuerySettingsInterface;
+use TYPO3\CMS\Core\Domain\Repository\PageRepository;
 use TYPO3\CMS\Extbase\Persistence\Generic\Storage\Predicate\LanguagePredicate;
+use TYPO3\CMS\Extbase\Persistence\Generic\Storage\Predicate\VisibilityPredicate;
+use TYPO3\CMS\Extbase\Persistence\Generic\Typo3QuerySettings;
 
 final class LanguagePredicateTest extends AbstractPredicateTestCase
 {
@@ -37,11 +40,26 @@ final class LanguagePredicateTest extends AbstractPredicateTestCase
      */
     private array $visibilityAliases = [];
 
-    private function createQuerySettings(LanguageAspect $languageAspect): QuerySettingsInterface
+    private function createQuerySettings(LanguageAspect $languageAspect): Typo3QuerySettings
     {
-        $querySettings = self::createStub(QuerySettingsInterface::class);
+        $querySettings = self::createStub(Typo3QuerySettings::class);
         $querySettings->method('getLanguageAspect')->willReturn($languageAspect);
+        $querySettings->method('isFrontendContext')->willReturn(true);
+        $querySettings->method('getEnableFieldsToBeIgnored')->willReturn([]);
         return $querySettings;
+    }
+
+    /**
+     * A real VisibilityPredicate in frontend mode; the PageRepository renders "VISIBLE <alias>" and records the alias.
+     */
+    private function createVisibilityPredicate(): VisibilityPredicate
+    {
+        $pageRepository = self::createStub(PageRepository::class);
+        $pageRepository->method('getDefaultConstraints')->willReturnCallback(function (string $table, array $ignore, string $alias): array {
+            $this->visibilityAliases[] = $alias;
+            return ['visible' => 'VISIBLE ' . $alias];
+        });
+        return new VisibilityPredicate($this->createTcaSchemaFactory(), $pageRepository, self::createStub(ConnectionPool::class));
     }
 
     /**
@@ -79,16 +97,12 @@ final class LanguagePredicateTest extends AbstractPredicateTestCase
 
     private function build(string $tableName, LanguageAspect $languageAspect): string
     {
-        $subject = new LanguagePredicate($this->createTcaSchemaFactory());
+        $subject = new LanguagePredicate($this->createTcaSchemaFactory(), $this->createVisibilityPredicate());
         return (string)$subject->build(
             $this->createQueryBuilder(),
             $tableName,
             'a',
             $this->createQuerySettings($languageAspect),
-            function (string $alias): string {
-                $this->visibilityAliases[] = $alias;
-                return 'VISIBLE ' . $alias;
-            }
         );
     }
 

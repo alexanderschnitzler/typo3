@@ -85,6 +85,12 @@ class Typo3QuerySettings implements QuerySettingsInterface
 
     protected LanguageAspect $languageAspect;
 
+    /**
+     * Whether frontend rules apply to enable fields (default constraints of PageRepository) or backend rules
+     * (BackendUtility::BEenableFields()). Decided from the global request when the settings are created.
+     */
+    protected bool $frontendContext = false;
+
     public function __construct(
         Context $context,
         ConfigurationManagerInterface $configurationManager
@@ -95,11 +101,47 @@ class Typo3QuerySettings implements QuerySettingsInterface
         $this->configurationManager = $configurationManager;
         $this->languageAspect = $this->context->getAspect('language');
         // see note in class' phpdoc about this condition
-        if (($GLOBALS['TYPO3_REQUEST'] ?? null) instanceof ServerRequestInterface
-            && ApplicationType::fromRequest($GLOBALS['TYPO3_REQUEST'])->isBackend()
-        ) {
-            $this->setIgnoreEnableFields(true);
+        $request = $GLOBALS['TYPO3_REQUEST'] ?? null;
+        if ($request instanceof ServerRequestInterface) {
+            $applicationType = ApplicationType::fromRequest($request);
+            $this->frontendContext = $applicationType->isFrontend();
+            if ($applicationType->isBackend()) {
+                $this->setIgnoreEnableFields(true);
+            }
         }
+    }
+
+    /**
+     * Whether the global request is a frontend request. Used for query settings that do not carry
+     * the decision themselves (other implementations of QuerySettingsInterface).
+     *
+     * @internal only to be used within Extbase, not part of TYPO3 Core API.
+     */
+    public static function isFrontendRequest(): bool
+    {
+        return ($GLOBALS['TYPO3_REQUEST'] ?? null) instanceof ServerRequestInterface
+            && ApplicationType::fromRequest($GLOBALS['TYPO3_REQUEST'])->isFrontend();
+    }
+
+    /**
+     * Whether frontend rules apply to enable fields and workspaces of this query.
+     *
+     * @internal only to be used within Extbase, not part of TYPO3 Core API.
+     */
+    public function isFrontendContext(): bool
+    {
+        return $this->frontendContext;
+    }
+
+    /**
+     * Overrides the frontend/backend decision taken from the global request at creation.
+     *
+     * @internal only to be used within Extbase, not part of TYPO3 Core API.
+     */
+    public function setFrontendContext(bool $frontendContext): self
+    {
+        $this->frontendContext = $frontendContext;
+        return $this;
     }
 
     /**
@@ -255,6 +297,7 @@ class Typo3QuerySettings implements QuerySettingsInterface
             'includeDeleted',
             'respectSysLanguage',
             'languageAspect',
+            'frontendContext',
         ];
     }
 

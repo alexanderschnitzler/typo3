@@ -21,13 +21,16 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\Test;
 use TYPO3\CMS\Core\Context\Context;
 use TYPO3\CMS\Core\Context\WorkspaceAspect;
+use TYPO3\CMS\Core\Core\SystemEnvironmentBuilder;
 use TYPO3\CMS\Core\Database\ConnectionPool;
 use TYPO3\CMS\Core\Domain\Repository\PageRepository;
+use TYPO3\CMS\Core\Http\ServerRequest;
 use TYPO3\CMS\Core\Schema\TcaSchemaFactory;
 use TYPO3\CMS\Core\Utility\GeneralUtility;
 use TYPO3\CMS\Extbase\Persistence\Generic\Exception\InconsistentQuerySettingsException;
 use TYPO3\CMS\Extbase\Persistence\Generic\QuerySettingsInterface;
 use TYPO3\CMS\Extbase\Persistence\Generic\Storage\Predicate\VisibilityPredicate;
+use TYPO3\CMS\Extbase\Persistence\Generic\Typo3QuerySettings;
 
 final class VisibilityPredicateTest extends AbstractPredicateTestCase
 {
@@ -42,9 +45,10 @@ final class VisibilityPredicateTest extends AbstractPredicateTestCase
         $this->tcaSchemaFactory = $this->createTcaSchemaFactory();
     }
 
-    private function createQuerySettings(bool $ignoreEnableFields, array $enableFieldsToBeIgnored, bool $includeDeleted): QuerySettingsInterface
+    private function createQuerySettings(bool $ignoreEnableFields, array $enableFieldsToBeIgnored, bool $includeDeleted, bool $frontend): Typo3QuerySettings
     {
-        $querySettings = self::createStub(QuerySettingsInterface::class);
+        $querySettings = self::createStub(Typo3QuerySettings::class);
+        $querySettings->method('isFrontendContext')->willReturn($frontend);
         $querySettings->method('getIgnoreEnableFields')->willReturn($ignoreEnableFields);
         $querySettings->method('getEnableFieldsToBeIgnored')->willReturn($enableFieldsToBeIgnored);
         $querySettings->method('getIncludeDeleted')->willReturn($includeDeleted);
@@ -66,8 +70,8 @@ final class VisibilityPredicateTest extends AbstractPredicateTestCase
         $pageRepository = $this->createMock(PageRepository::class);
         $pageRepository->expects($this->never())->method('getDefaultConstraints');
         $subject = new VisibilityPredicate($this->tcaSchemaFactory, $pageRepository, $this->createConnectionPool());
-        self::assertSame('', $subject->build($this->createQuerySettings(false, [], false), 'tx_unknown', 'tx_unknown', true));
-        self::assertSame('', $subject->build($this->createQuerySettings(false, [], false), 'tx_unknown', 'tx_unknown', false));
+        self::assertSame('', $subject->build($this->createQuerySettings(false, [], false, true), 'tx_unknown', 'tx_unknown'));
+        self::assertSame('', $subject->build($this->createQuerySettings(false, [], false, false), 'tx_unknown', 'tx_unknown'));
     }
 
     public static function frontendDataProvider(): array
@@ -95,7 +99,7 @@ final class VisibilityPredicateTest extends AbstractPredicateTestCase
             ->with('tx_test_deleted', $expectedIgnoreList, 'a')
             ->willReturn($constraints);
         $subject = new VisibilityPredicate($this->tcaSchemaFactory, $pageRepository, $this->createConnectionPool());
-        self::assertSame($expected, $subject->build($this->createQuerySettings($ignoreEnableFields, $enableFieldsToBeIgnored, $includeDeleted), 'tx_test_deleted', 'a', true));
+        self::assertSame($expected, $subject->build($this->createQuerySettings($ignoreEnableFields, $enableFieldsToBeIgnored, $includeDeleted, true), 'tx_test_deleted', 'a'));
     }
 
     public static function frontendWithoutPageRepositoryDataProvider(): array
@@ -121,7 +125,19 @@ final class VisibilityPredicateTest extends AbstractPredicateTestCase
         $pageRepository = $this->createMock(PageRepository::class);
         $pageRepository->expects($this->never())->method('getDefaultConstraints');
         $subject = new VisibilityPredicate($this->tcaSchemaFactory, $pageRepository, $this->createConnectionPool());
-        self::assertSame($expected, $subject->build($this->createQuerySettings($ignoreEnableFields, $enableFieldsToBeIgnored, $includeDeleted), $tableName, 'a', true));
+        self::assertSame($expected, $subject->build($this->createQuerySettings($ignoreEnableFields, $enableFieldsToBeIgnored, $includeDeleted, true), $tableName, 'a'));
+    }
+
+    #[Test]
+    public function otherQuerySettingsImplementationsFallBackToGlobalRequest(): void
+    {
+        $GLOBALS['TYPO3_REQUEST'] = new ServerRequest()->withAttribute('applicationType', SystemEnvironmentBuilder::REQUESTTYPE_FE);
+        $querySettings = self::createStub(QuerySettingsInterface::class);
+        $pageRepository = $this->createMock(PageRepository::class);
+        $pageRepository->expects($this->once())->method('getDefaultConstraints')->with('tx_test_deleted', [], 'a')->willReturn(['deleted' => 'a.deleted = 0']);
+        $subject = new VisibilityPredicate($this->tcaSchemaFactory, $pageRepository, $this->createConnectionPool());
+        self::assertSame('a.deleted = 0', $subject->build($querySettings, 'tx_test_deleted', 'a'));
+        unset($GLOBALS['TYPO3_REQUEST']);
     }
 
     #[Test]
@@ -130,7 +146,7 @@ final class VisibilityPredicateTest extends AbstractPredicateTestCase
         $subject = new VisibilityPredicate($this->tcaSchemaFactory, self::createStub(PageRepository::class), $this->createConnectionPool());
         $this->expectException(InconsistentQuerySettingsException::class);
         $this->expectExceptionCode(1460975922);
-        $subject->build($this->createQuerySettings(false, [], true), 'tx_test_deleted', 'a', true);
+        $subject->build($this->createQuerySettings(false, [], true, true), 'tx_test_deleted', 'a');
     }
 
     public static function backendDataProvider(): array
@@ -164,7 +180,7 @@ final class VisibilityPredicateTest extends AbstractPredicateTestCase
             GeneralUtility::addInstance(ConnectionPool::class, $this->createConnectionPool());
         }
         $subject = new VisibilityPredicate($this->tcaSchemaFactory, self::createStub(PageRepository::class), $this->createConnectionPool());
-        self::assertSame($expected, $subject->build($this->createQuerySettings($ignoreEnableFields, [], $includeDeleted), 'tx_test_deleted', $tableAlias, false));
+        self::assertSame($expected, $subject->build($this->createQuerySettings($ignoreEnableFields, [], $includeDeleted, false), 'tx_test_deleted', $tableAlias));
     }
 
     #[Test]
@@ -174,6 +190,6 @@ final class VisibilityPredicateTest extends AbstractPredicateTestCase
         GeneralUtility::addInstance(TcaSchemaFactory::class, $this->tcaSchemaFactory);
         GeneralUtility::addInstance(ConnectionPool::class, $this->createConnectionPool());
         $subject = new VisibilityPredicate($this->tcaSchemaFactory, self::createStub(PageRepository::class), $this->createConnectionPool());
-        self::assertSame('', $subject->build($this->createQuerySettings(false, [], false), 'tx_test_plain', 'a', false));
+        self::assertSame('', $subject->build($this->createQuerySettings(false, [], false, false), 'tx_test_plain', 'a'));
     }
 }

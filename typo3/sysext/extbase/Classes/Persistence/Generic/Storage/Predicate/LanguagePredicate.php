@@ -34,19 +34,17 @@ final readonly class LanguagePredicate
 {
     public function __construct(
         private TcaSchemaFactory $tcaSchemaFactory,
+        private VisibilityPredicate $visibilityPredicate,
     ) {}
 
     /**
      * @param QueryBuilder $queryBuilder The query the condition is built for; sub-selects use its connection
-     * @param \Closure(string): string $visibilityConstraint Returns the enable-field condition for a table alias
-     *                                                     of $tableName, used inside the sub-selects
      */
     public function build(
         QueryBuilder $queryBuilder,
         string $tableName,
         string $tableAlias,
         QuerySettingsInterface $querySettings,
-        \Closure $visibilityConstraint,
     ): CompositeExpression|string {
         if (!$this->tcaSchemaFactory->has($tableName)) {
             return '';
@@ -87,7 +85,7 @@ final readonly class LanguagePredicate
             ->where(
                 $defaultLanguageRecordsSubSelect->expr()->eq($defLangTableAlias . '.' . $transOrigPointerField, 0),
                 $defaultLanguageRecordsSubSelect->expr()->eq($defLangTableAlias . '.' . $languageField, 0),
-                $visibilityConstraint($defLangTableAlias)
+                $this->visibilityPredicate->build($querySettings, $tableName, $defLangTableAlias)
             );
 
         $andConditions = [];
@@ -125,7 +123,7 @@ final readonly class LanguagePredicate
                     $queryBuilderForSubselect->expr()->gt($translatedOnlyTableAlias . '.' . $transOrigPointerField, 0),
                     $queryBuilderForSubselect->expr()->eq($translatedOnlyTableAlias . '.' . $languageField, $languageAspect->getContentId()),
                     //  The records in default language should also respect the visibility constraints
-                    $visibilityConstraint($translatedOnlyTableAlias)
+                    $this->visibilityPredicate->build($querySettings, $tableName, $translatedOnlyTableAlias)
                 );
             // records in default language, which do not have a translation
             $andConditions[] = $queryBuilder->expr()->and(

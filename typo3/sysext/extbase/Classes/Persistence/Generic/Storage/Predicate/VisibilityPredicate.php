@@ -26,6 +26,7 @@ use TYPO3\CMS\Core\Schema\TcaSchemaFactory;
 use TYPO3\CMS\Core\Utility\GeneralUtility;
 use TYPO3\CMS\Extbase\Persistence\Generic\Exception\InconsistentQuerySettingsException;
 use TYPO3\CMS\Extbase\Persistence\Generic\QuerySettingsInterface;
+use TYPO3\CMS\Extbase\Persistence\Generic\Typo3QuerySettings;
 
 /**
  * Builds the enable-field and deleted condition of an Extbase query for one table alias.
@@ -44,15 +45,19 @@ final readonly class VisibilityPredicate
     ) {}
 
     /**
-     * @param bool $isFrontend Whether the frontend or the backend rules apply
+     * Frontend or backend rules are taken from the query settings, see Typo3QuerySettings::isFrontendContext().
+     *
      * @return string The condition, or an empty string if nothing needs to be restricted
      * @throws InconsistentQuerySettingsException
      */
-    public function build(QuerySettingsInterface $querySettings, string $tableName, string $tableAlias, bool $isFrontend): string
+    public function build(QuerySettingsInterface $querySettings, string $tableName, string $tableAlias): string
     {
         if (!$this->tcaSchemaFactory->has($tableName)) {
             return '';
         }
+        $isFrontend = $querySettings instanceof Typo3QuerySettings
+            ? $querySettings->isFrontendContext()
+            : Typo3QuerySettings::isFrontendRequest();
 
         $ignoreEnableFields = $querySettings->getIgnoreEnableFields();
         $enableFieldsToBeIgnored = $querySettings->getEnableFieldsToBeIgnored();
