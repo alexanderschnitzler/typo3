@@ -24,11 +24,14 @@ use TYPO3\CMS\Core\Context\LanguageAspect;
 use TYPO3\CMS\Core\Context\WorkspaceAspect;
 use TYPO3\CMS\Core\Core\SystemEnvironmentBuilder;
 use TYPO3\CMS\Core\Database\ConnectionPool;
+use TYPO3\CMS\Core\EventDispatcher\ListenerProvider;
 use TYPO3\CMS\Core\Http\ServerRequest;
 use TYPO3\CMS\Extbase\Configuration\ConfigurationManager;
 use TYPO3\CMS\Extbase\Configuration\ConfigurationManagerInterface;
 use TYPO3\CMS\Extbase\DomainObject\AbstractDomainObject;
 use TYPO3\CMS\Extbase\DomainObject\DomainObjectInterface;
+use TYPO3\CMS\Extbase\Event\Persistence\ModifyQueryBeforeFetchingObjectDataEvent;
+use TYPO3\CMS\Extbase\Event\Persistence\ModifyResultAfterFetchingObjectDataEvent;
 use TYPO3\CMS\Extbase\Persistence\Generic\PersistenceManager;
 use TYPO3\CMS\Extbase\Persistence\QueryInterface;
 use TYPO3\CMS\Extbase\Property\PropertyMapper;
@@ -602,5 +605,161 @@ final class BehaviourConformanceTest extends FunctionalTestCase
         $this->get(PersistenceManager::class)->persistAll();
         self::assertSame(['title' => 'changed in workspace', 'deleted' => 0], $this->fetchPostRow($liveUid));
         self::assertSame(['title' => $versionTitle, 'deleted' => 0], $this->fetchPostRow($versionUid));
+    }
+
+    /**
+     * A new object gets its pid from the configured storagePid.
+     */
+    #[Test]
+    public function insertUsesConfiguredStoragePid(): void
+    {
+        $post = new Post();
+        $post->setTitle('new post');
+        $this->get(PostRepository::class)->add($post);
+        $this->get(PersistenceManager::class)->persistAll();
+        self::assertSame(20, $post->getPid());
+        self::assertSame(['pid' => 20], $this->fetchPostRow($post->getUid(), ['pid']));
+    }
+
+    /**
+     * crdate and tstamp are set to the request time on insert; tstamp is
+     * refreshed on every update.
+     */
+    #[Test]
+    public function insertSetsCrdateAndTstampToRequestTime(): void
+    {
+        $post = new Post();
+        $post->setTitle('new post');
+        $this->get(PostRepository::class)->add($post);
+        $this->get(PersistenceManager::class)->persistAll();
+        $row = $this->fetchPostRow($post->getUid(), ['crdate', 'tstamp']);
+        self::assertSame((int)$GLOBALS['EXEC_TIME'], (int)$row['crdate']);
+        self::assertSame((int)$GLOBALS['EXEC_TIME'], (int)$row['tstamp']);
+    }
+
+    /**
+     * A new object's translation-parent column defaults to 0.
+     *
+     * @todo Forge #<T14>: Extbase never creates a linked translation for a newly inserted object.
+     */
+    #[Test]
+    public function insertWritesTranslationParentZeroByDefault(): void
+    {
+        $post = new Post();
+        $post->setTitle('new post');
+        $this->get(PostRepository::class)->add($post);
+        $this->get(PersistenceManager::class)->persistAll();
+        self::assertSame(['l18n_parent' => 0], $this->fetchPostRow($post->getUid(), ['l18n_parent']));
+    }
+
+    /**
+     * MM rows of a new relation are written in the order the objects were
+     * added, using the `sorting`/`sorting_foreign` column implied by MM_opposite_field.
+     */
+    #[Test]
+    public function mmSortingPersistsTagInsertionOrder(): void
+    {
+        $persistenceManager = $this->get(PersistenceManager::class);
+        $tagOne = $persistenceManager->getObjectByIdentifier(2, Tag::class);
+        $tagTwo = $persistenceManager->getObjectByIdentifier(3, Tag::class);
+        $post = new Post();
+        $post->setTitle('new post with tags');
+        $post->addTag($tagOne);
+        $post->addTag($tagTwo);
+        $this->get(PostRepository::class)->add($post);
+        $persistenceManager->persistAll();
+
+        $queryBuilder = $this->get(ConnectionPool::class)->getQueryBuilderForTable('tx_blogexample_domain_model_tag_mm');
+        $queryBuilder->getRestrictions()->removeAll();
+        $rows = $queryBuilder->select('uid_local', 'sorting_foreign')->from('tx_blogexample_domain_model_tag_mm')
+            ->where($queryBuilder->expr()->eq('uid_foreign', $post->getUid()))
+            ->orderBy('sorting_foreign')
+            ->executeQuery()->fetchAllAssociative();
+        self::assertSame([['uid_local' => 2, 'sorting_foreign' => 1], ['uid_local' => 3, 'sorting_foreign' => 2]], $rows);
+    }
+
+    /**
+     * Updating a translated object outside a workspace writes the translation row,
+     * the default-language row stays unchanged (contrast with updateInWorkspaceWritesLiveRow(),
+     * which is the same write target inside a workspace).
+     */
+    #[Test]
+    public function updatingTranslatedObjectOutsideWorkspaceWritesTranslationRow(): void
+    {
+        $this->setLanguage(1, LanguageAspect::OVERLAYS_ON);
+        $postRepository = $this->get(PostRepository::class);
+        $post = $postRepository->findByUid(2);
+        self::assertSame('P2 DA', $post->getTitle());
+        $post->setTitle('changed DA');
+        $postRepository->update($post);
+        $this->get(PersistenceManager::class)->persistAll();
+        self::assertSame(['title' => 'P2', 'deleted' => 0], $this->fetchPostRow(2));
+        self::assertSame(['title' => 'changed DA', 'deleted' => 0], $this->fetchPostRow(11));
+    }
+
+    /**
+     * Known hole: removing a translated object soft-deletes the default-language record, the translation stays.
+     *
+     * @todo Forge #<T13>: delete the row that was loaded (the translation).
+     */
+    #[Test]
+    public function removingTranslatedObjectDeletesDefaultRecord(): void
+    {
+        $this->setLanguage(1, LanguageAspect::OVERLAYS_ON);
+        $postRepository = $this->get(PostRepository::class);
+        $post = $postRepository->findByUid(2);
+        self::assertSame('P2 DA|2|11|1', self::describe($post));
+        $postRepository->remove($post);
+        $this->get(PersistenceManager::class)->persistAll();
+        self::assertSame(['title' => 'P2', 'deleted' => 1], $this->fetchPostRow(2));
+        self::assertSame(['title' => 'P2 DA', 'deleted' => 0], $this->fetchPostRow(11));
+    }
+
+    /**
+     * `_languageUid` is unaffected by an ordinary update - the update writes to
+     * the same language the object was loaded in.
+     */
+    #[Test]
+    public function updatingTranslatedObjectPreservesLanguageUid(): void
+    {
+        $this->setLanguage(1, LanguageAspect::OVERLAYS_ON);
+        $postRepository = $this->get(PostRepository::class);
+        $post = $postRepository->findByUid(2);
+        self::assertSame(1, $post->_getProperty(AbstractDomainObject::PROPERTY_LANGUAGE_UID));
+        $post->setTitle('changed DA again');
+        $postRepository->update($post);
+        $this->get(PersistenceManager::class)->persistAll();
+        self::assertSame(1, (int)$this->fetchPostRow(11, ['sys_language_uid'])['sys_language_uid']);
+    }
+
+    /**
+     * ModifyQueryBeforeFetchingObjectDataEvent fires before the SQL is executed,
+     * ModifyResultAfterFetchingObjectDataEvent after - in that order, once each.
+     */
+    #[Test]
+    public function fetchEventsFireBeforeAndAfterObjectDataInOrder(): void
+    {
+        $order = [];
+        $container = $this->get('service_container');
+        $container->set('before-fetch-listener', static function (ModifyQueryBeforeFetchingObjectDataEvent $event) use (&$order): void {
+            $order[] = 'before';
+        });
+        $container->set('after-fetch-listener', static function (ModifyResultAfterFetchingObjectDataEvent $event) use (&$order): void {
+            $order[] = 'after';
+        });
+        $listenerProvider = $this->get(ListenerProvider::class);
+        $listenerProvider->addListener(ModifyQueryBeforeFetchingObjectDataEvent::class, 'before-fetch-listener');
+        $listenerProvider->addListener(ModifyResultAfterFetchingObjectDataEvent::class, 'after-fetch-listener');
+
+        $this->get(PostRepository::class)->findByUid(1);
+
+        // findByUid(1) triggers one object-data fetch per eagerly-touched relation query
+        // (each with its own before/after pair), so assert strict alternation rather than
+        // exactly one pair: every "before" must be immediately followed by its "after".
+        self::assertNotEmpty($order);
+        self::assertSame(0, count($order) % 2, 'expected an even number of before/after events');
+        foreach (array_chunk($order, 2) as $pair) {
+            self::assertSame(['before', 'after'], $pair);
+        }
     }
 }
