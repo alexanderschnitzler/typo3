@@ -91,6 +91,50 @@ class Backend implements BackendInterface
     }
 
     /**
+     * Resolves which uid a write operation targets. Reproduces today's per-operation choices
+     * exactly, inconsistencies included: most writes use the object's own uid, some
+     * relation writes prefer `_localizedUid` when the object is a translation, and one of those
+     * two shapes is not even the same when `_localizedUid` happens to be `0`. Nothing here is
+     * "the right" choice: it is the current one, on purpose.
+     *
+     * | Target                          | Former inline decision                                        | Uid used |
+     * |----------------------------------|---------------------------------------------------------------|----------|
+     * | WriteTarget::OneToManyInsert | the former inline decision in `insertObject()` (FK on the new child's own row) | object's own uid |
+     * | WriteTarget::OneToManyAttach | the former inline decision in `attachObjectToParentObjectRelationHasMany()` | `_localizedUid ?: uid` (falls back on `0` too) |
+     * | WriteTarget::MmInsert        | the former inline decision in `insertRelationInRelationtable()` | `_localizedUid` if not `null`, else uid |
+     * | WriteTarget::MmUpdate        | the former inline decision in `updateRelationInRelationTable()` | object's own uid |
+     * | WriteTarget::MmDeleteAll     | the former inline decision in `deleteAllRelationsFromRelationtable()` | object's own uid |
+     * | WriteTarget::MmDeleteOne     | the former inline decision in `deleteRelationFromRelationtable()` | object's own uid |
+     * | WriteTarget::Update          | the former inline decision in `updateObject()` | `_localizedUid` if the table is language-aware and it is not `null`, else uid |
+     * | WriteTarget::Delete          | the former inline decision in `removeEntity()` | object's own uid (the known hole: a translated object's delete targets the default row, @todo Forge #<T13>) |
+     *
+     * @internal only to be used within Backend, not part of TYPO3 Core API.
+     */
+    protected function resolveWriteUid(DomainObjectInterface $object, WriteTarget $target): int
+    {
+        return match ($target) {
+            WriteTarget::OneToManyInsert,
+            WriteTarget::MmUpdate,
+            WriteTarget::MmDeleteAll,
+            WriteTarget::MmDeleteOne,
+            WriteTarget::Delete => (int)$object->getUid(),
+            WriteTarget::OneToManyAttach => (int)($object->_getProperty(AbstractDomainObject::PROPERTY_LOCALIZED_UID) ?: $object->getUid()),
+            WriteTarget::MmInsert => (int)($object->_getProperty(AbstractDomainObject::PROPERTY_LOCALIZED_UID) ?? $object->getUid()),
+            WriteTarget::Update => $this->resolveUpdateWriteUid($object),
+        };
+    }
+
+    private function resolveUpdateWriteUid(DomainObjectInterface $object): int
+    {
+        $dataMap = $this->dataMapFactory->buildDataMap(get_class($object));
+        $localizedUid = $object->_getProperty(AbstractDomainObject::PROPERTY_LOCALIZED_UID);
+        if ($dataMap->languageIdColumnName !== null && $localizedUid !== null) {
+            return (int)$localizedUid;
+        }
+        return (int)$object->getUid();
+    }
+
+    /**
      * Returns the number of records matching the query.
      *
      * @return int
@@ -482,7 +526,7 @@ class Backend implements BackendInterface
         }
         $row = [];
         if ($parentColumnMap->parentKeyFieldName !== null) {
-            $row[$parentColumnMap->parentKeyFieldName] = $parentObject->_getProperty(AbstractDomainObject::PROPERTY_LOCALIZED_UID) ?: $parentObject->getUid();
+            $row[$parentColumnMap->parentKeyFieldName] = $this->resolveWriteUid($parentObject, WriteTarget::OneToManyAttach);
             if ($parentColumnMap->parentTableFieldName !== null) {
                 $row[$parentColumnMap->parentTableFieldName] = $parentDataMap->tableName;
             }
@@ -587,7 +631,7 @@ class Backend implements BackendInterface
             $parentColumnDataMap = $this->dataMapFactory->buildDataMap(get_class($parentObject))->getColumnMap($parentPropertyName);
             $row = array_merge($parentColumnDataMap->relationTableMatchFields, $row);
             if ($parentColumnDataMap->parentKeyFieldName !== null) {
-                $row[$parentColumnDataMap->parentKeyFieldName] = (int)$parentObject->getUid();
+                $row[$parentColumnDataMap->parentKeyFieldName] = $this->resolveWriteUid($parentObject, WriteTarget::OneToManyInsert);
             }
         }
 
@@ -640,13 +684,9 @@ class Backend implements BackendInterface
     ): int {
         $dataMap = $this->dataMapFactory->buildDataMap(get_class($parentObject));
         $columnMap = $dataMap->getColumnMap($propertyName);
-        $parentUid = $parentObject->getUid();
-        if ($parentObject->_getProperty(AbstractDomainObject::PROPERTY_LOCALIZED_UID) !== null) {
-            $parentUid = $parentObject->_getProperty(AbstractDomainObject::PROPERTY_LOCALIZED_UID);
-        }
         $row = [];
         if ($columnMap->parentKeyFieldName !== null) {
-            $row[$columnMap->parentKeyFieldName] = (int)$parentUid;
+            $row[$columnMap->parentKeyFieldName] = $this->resolveWriteUid($parentObject, WriteTarget::MmInsert);
         }
         if ($columnMap->childKeyFieldName !== null) {
             $row[$columnMap->childKeyFieldName] = (int)$object->getUid();
@@ -677,7 +717,7 @@ class Backend implements BackendInterface
         $columnMap = $dataMap->getColumnMap($propertyName);
         $row = [];
         if ($columnMap->parentKeyFieldName !== null) {
-            $row[$columnMap->parentKeyFieldName] = (int)$parentObject->getUid();
+            $row[$columnMap->parentKeyFieldName] = $this->resolveWriteUid($parentObject, WriteTarget::MmUpdate);
         }
         if ($columnMap->childKeyFieldName !== null) {
             $row[$columnMap->childKeyFieldName] = (int)$object->getUid();
@@ -705,7 +745,7 @@ class Backend implements BackendInterface
         $relationTableName = $columnMap->relationTableName;
         $relationMatchFields = [];
         if ($columnMap->parentKeyFieldName !== null) {
-            $relationMatchFields[$columnMap->parentKeyFieldName] = (int)$parentObject->getUid();
+            $relationMatchFields[$columnMap->parentKeyFieldName] = $this->resolveWriteUid($parentObject, WriteTarget::MmDeleteAll);
         }
         $relationMatchFields = array_merge($columnMap->relationTableMatchFields, $relationMatchFields);
         $this->storageBackend->removeRow($relationTableName, $relationMatchFields);
@@ -725,7 +765,7 @@ class Backend implements BackendInterface
         $relationTableName = $columnMap->relationTableName;
         $relationMatchFields = [];
         if ($columnMap->parentKeyFieldName !== null) {
-            $relationMatchFields[$columnMap->parentKeyFieldName] = (int)$parentObject->getUid();
+            $relationMatchFields[$columnMap->parentKeyFieldName] = $this->resolveWriteUid($parentObject, WriteTarget::MmDeleteOne);
         }
         if ($columnMap->childKeyFieldName !== null) {
             $relationMatchFields[$columnMap->childKeyFieldName] = (int)$relatedObject->getUid();
@@ -742,12 +782,9 @@ class Backend implements BackendInterface
     {
         $dataMap = $this->dataMapFactory->buildDataMap(get_class($object));
         $this->addCommonFieldsToRow($object, $row);
-        $row['uid'] = $object->getUid();
+        $row['uid'] = $this->resolveWriteUid($object, WriteTarget::Update);
         if ($dataMap->languageIdColumnName !== null) {
             $row[$dataMap->languageIdColumnName] = (int)$object->_getProperty(AbstractDomainObject::PROPERTY_LANGUAGE_UID);
-            if ($object->_getProperty(AbstractDomainObject::PROPERTY_LOCALIZED_UID) !== null) {
-                $row['uid'] = $object->_getProperty(AbstractDomainObject::PROPERTY_LOCALIZED_UID);
-            }
         }
         $this->storageBackend->updateRow($dataMap->tableName, $row);
         $this->eventDispatcher->dispatch(new EntityUpdatedInPersistenceEvent($object));
@@ -804,21 +841,22 @@ class Backend implements BackendInterface
     protected function removeEntity(DomainObjectInterface $object, bool $markAsDeleted = true): void
     {
         $dataMap = $this->dataMapFactory->buildDataMap(get_class($object));
+        $writeUid = $this->resolveWriteUid($object, WriteTarget::Delete);
         if ($markAsDeleted === true && $dataMap->deletedFlagColumnName !== null) {
             $deletedColumnName = $dataMap->deletedFlagColumnName;
             $row = [
-                'uid' => $object->getUid(),
+                'uid' => $writeUid,
                 $deletedColumnName => 1,
             ];
             $this->addCommonDateFieldsToRow($object, $row);
             $this->storageBackend->updateRow($dataMap->tableName, $row);
         } else {
-            $this->storageBackend->removeRow($dataMap->tableName, ['uid' => $object->getUid()]);
+            $this->storageBackend->removeRow($dataMap->tableName, ['uid' => $writeUid]);
         }
         $this->eventDispatcher->dispatch(new EntityRemovedFromPersistenceEvent($object));
 
         $this->removeRelatedObjects($object);
-        $this->referenceIndex->updateRefIndexTable($dataMap->tableName, $object->getUid());
+        $this->referenceIndex->updateRefIndexTable($dataMap->tableName, $writeUid);
     }
 
     /**
