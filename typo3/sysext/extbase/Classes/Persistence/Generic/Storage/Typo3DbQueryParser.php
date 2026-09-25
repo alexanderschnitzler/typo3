@@ -60,6 +60,7 @@ use TYPO3\CMS\Extbase\Persistence\Generic\Storage\Exception\BadConstraintExcepti
 use TYPO3\CMS\Extbase\Persistence\Generic\Storage\Predicate\LanguagePredicate;
 use TYPO3\CMS\Extbase\Persistence\Generic\Storage\Predicate\StoragePagePredicate;
 use TYPO3\CMS\Extbase\Persistence\Generic\Storage\Predicate\VisibilityPredicate;
+use TYPO3\CMS\Extbase\Persistence\Generic\Storage\Predicate\WorkspacePredicate;
 use TYPO3\CMS\Extbase\Persistence\QueryInterface;
 
 /**
@@ -100,6 +101,7 @@ class Typo3DbQueryParser
         protected readonly StoragePagePredicate $storagePagePredicate,
         protected readonly VisibilityPredicate $visibilityPredicate,
         protected readonly LanguagePredicate $languagePredicate,
+        protected readonly WorkspacePredicate $workspacePredicate,
     ) {}
 
     /**
@@ -649,9 +651,9 @@ class Typo3DbQueryParser
                 $whereClause[] = $pageIdStatement;
             }
         }
-        if ($this->tcaSchemaFactory->has($tableName) && $this->tcaSchemaFactory->get($tableName)->isWorkspaceAware()) {
-            // Always prevent workspace records from being returned (except for newly created records)
-            $whereClause[] = $this->queryBuilder->expr()->eq($tableAlias . '.t3ver_oid', 0);
+        $workspaceStatement = $this->workspacePredicate->build($this->queryBuilder->expr(), $tableName, $tableAlias);
+        if ($workspaceStatement !== '') {
+            $whereClause[] = $workspaceStatement;
         }
 
         return $whereClause;
