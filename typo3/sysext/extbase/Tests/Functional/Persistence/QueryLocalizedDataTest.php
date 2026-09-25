@@ -95,7 +95,7 @@ final class QueryLocalizedDataTest extends FunctionalTestCase
 
         // Fetching a translated record directly by its uid returns the translated record at all
         // times, regardless of the language configured in the current context (see "Note #1" in
-        // Typo3DbBackend->overlayLanguageAndWorkspaceForSingleRecord()).
+        // RowOverlayService->overlayLanguageAndWorkspaceForSingleRecord()).
         $post2translated = $this->postRepository->findByUid(11);
         self::assertEquals(['Post 2 - DA', 2, 11, 'Blog 1 DA', 1, 2, 'Translated John', 1, 2], [
             $post2translated->getTitle(),
@@ -137,7 +137,7 @@ final class QueryLocalizedDataTest extends FunctionalTestCase
 
         // Fetching a translated record directly by its uid returns the translated record at all
         // times, regardless of the language configured in the current context (see "Note #1" in
-        // Typo3DbBackend->overlayLanguageAndWorkspaceForSingleRecord()).
+        // RowOverlayService->overlayLanguageAndWorkspaceForSingleRecord()).
         $post2translated = $this->postRepository->findByUid(11);
         self::assertEquals(['Post 2 - DA', 2, 11, 'Blog 1 DA', 1, 2, 'Translated John', 1, 2], [
             $post2translated->getTitle(),

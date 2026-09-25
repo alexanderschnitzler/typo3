@@ -27,27 +27,23 @@ use Symfony\Component\DependencyInjection\Attribute\Autowire;
 use TYPO3\CMS\Core\Cache\CacheTag;
 use TYPO3\CMS\Core\Cache\Event\AddCacheTagEvent;
 use TYPO3\CMS\Core\Context\Context;
-use TYPO3\CMS\Core\Context\LanguageAspect;
 use TYPO3\CMS\Core\Database\Connection;
 use TYPO3\CMS\Core\Database\ConnectionPool;
 use TYPO3\CMS\Core\Database\Query\QueryBuilder;
 use TYPO3\CMS\Core\Database\Query\Restriction\FrontendRestrictionContainer;
 use TYPO3\CMS\Core\Database\Query\Restriction\WorkspaceRestriction;
-use TYPO3\CMS\Core\Domain\Repository\PageRepository;
-use TYPO3\CMS\Core\Schema\Capability\TcaSchemaCapability;
-use TYPO3\CMS\Core\Schema\TcaSchemaFactory;
 use TYPO3\CMS\Core\Utility\GeneralUtility;
-use TYPO3\CMS\Core\Versioning\VersionState;
 use TYPO3\CMS\Extbase\DomainObject\AbstractDomainObject;
 use TYPO3\CMS\Extbase\DomainObject\AbstractValueObject;
 use TYPO3\CMS\Extbase\Persistence\Generic\Mapper\DataMapper;
 use TYPO3\CMS\Extbase\Persistence\Generic\Qom\JoinInterface;
 use TYPO3\CMS\Extbase\Persistence\Generic\Qom\SelectorInterface;
-use TYPO3\CMS\Extbase\Persistence\Generic\Qom\SourceInterface;
 use TYPO3\CMS\Extbase\Persistence\Generic\Qom\Statement;
 use TYPO3\CMS\Extbase\Persistence\Generic\Query;
 use TYPO3\CMS\Extbase\Persistence\Generic\Storage\Exception\BadConstraintException;
 use TYPO3\CMS\Extbase\Persistence\Generic\Storage\Exception\SqlErrorException;
+use TYPO3\CMS\Extbase\Persistence\Generic\Storage\Overlay\OverlayContext;
+use TYPO3\CMS\Extbase\Persistence\Generic\Storage\Overlay\RowOverlayService;
 use TYPO3\CMS\Extbase\Persistence\Generic\Typo3QuerySettings;
 use TYPO3\CMS\Extbase\Persistence\QueryInterface;
 use TYPO3\CMS\Extbase\Reflection\ReflectionService;
@@ -67,10 +63,9 @@ readonly class Typo3DbBackend implements BackendInterface
         protected ReflectionService $reflectionService,
         protected EventDispatcherInterface $eventDispatcher,
         protected CacheLifetimeCalculator $cacheLifetimeCalculator,
-        protected TcaSchemaFactory $tcaSchemaFactory,
         #[Autowire(expression: 'service("features").isFeatureEnabled("frontend.cache.autoTagging")')]
         protected bool $autoTagging,
-        protected PageRepository $pageRepository,
+        protected RowOverlayService $rowOverlayService,
     ) {}
 
     /**
@@ -206,33 +201,6 @@ readonly class Typo3DbBackend implements BackendInterface
     public function getObjectDataByQuery(QueryInterface $query): array
     {
         $statement = $query->getStatement();
-        $querySettings = $query->getQuerySettings();
-        // A custom query is needed for the language, so a custom context is cloned
-        /** @var Context $context */
-        $context = clone GeneralUtility::makeInstance(Context::class);
-        $context->setAspect('language', $querySettings->getLanguageAspect());
-        if ($querySettings->getIgnoreEnableFields()) {
-            // The language overlay is fetched by PageRepository, which applies the frontend restrictions based on
-            // the visibility aspect. Ignored enable fields must therefore be mirrored into that aspect, otherwise a
-            // hidden or scheduled translation is never found and the default language record is dropped or kept
-            // untranslated. An empty list of enable fields means "ignore all of them".
-            $ignoredEnableFields = $querySettings->getEnableFieldsToBeIgnored();
-            $ignoreAll = $ignoredEnableFields === [];
-            $includeHidden = $ignoreAll || in_array('disabled', $ignoredEnableFields, true);
-            $includeScheduled = $ignoreAll
-                || in_array('starttime', $ignoredEnableFields, true)
-                || in_array('endtime', $ignoredEnableFields, true);
-            $visibility = $context->getAspect('visibility');
-            if ($includeHidden) {
-                $visibility = $visibility
-                    ->withIncludeHiddenPages(true)
-                    ->withIncludeHiddenContent(true);
-            }
-            if ($includeScheduled) {
-                $visibility = $visibility->withIncludeScheduledRecords(true);
-            }
-            $context->setAspect('visibility', $visibility);
-        }
         if ($statement instanceof Statement && !$statement->getStatement() instanceof QueryBuilder) {
             $rows = $this->getObjectDataByRawQuery($statement);
         } else {
@@ -261,7 +229,7 @@ readonly class Typo3DbBackend implements BackendInterface
                 // with overlays in SQL. So we use the "best guess" by adding twice the limit. Imagine you have
                 // 2000 news records, and we need to manually calculate the first 10 records, we just take 20 records
                 // from SQL and hope that this matches for "most" usecases (Pareto Principle).
-                if ($context->getAspect('workspace')->isLive()) {
+                if (GeneralUtility::makeInstance(Context::class)->getAspect('workspace')->isLive()) {
                     $queryBuilder->setMaxResults($query->getLimit());
                 } else {
                     $queryBuilder->setMaxResults($query->getLimit() * 2);
@@ -275,7 +243,7 @@ readonly class Typo3DbBackend implements BackendInterface
         }
 
         if (!empty($rows)) {
-            $rows = $this->overlayLanguageAndWorkspace($query->getSource(), $rows, $query, $context);
+            $rows = $this->overlayRows($query, $rows);
             if ($this->autoTagging) {
                 $source = $query->getSource();
                 if ($source instanceof JoinInterface) {
@@ -448,231 +416,32 @@ readonly class Typo3DbBackend implements BackendInterface
     }
 
     /**
-     * Performs workspace and language overlay on the given row array. The language and workspace id is automatically
-     * detected (depending on FE or BE context). You can also explicitly set the language/workspace id.
+     * Performs workspace and language overlay on the given rows, see RowOverlayService.
+     * Rows of a query without a proper source (no table name) are returned unchanged.
      */
-    protected function overlayLanguageAndWorkspace(SourceInterface $source, array $rows, QueryInterface $query, Context $context): array
+    private function overlayRows(QueryInterface $query, array $rows): array
     {
-        $workspaceUid = (int)$context->getPropertyFromAspect('workspace', 'id');
-
-        $pageRepository = $this->pageRepository->withContext($context);
+        $source = $query->getSource();
         if ($source instanceof SelectorInterface) {
             $tableName = $source->getSelectorName();
-            $rows = $this->resolveMovedRecordsInWorkspace($tableName, $rows, $workspaceUid);
-            return $this->overlayLanguageAndWorkspaceForSelect($tableName, $rows, $pageRepository, $query, $context);
-        }
-        if ($source instanceof JoinInterface) {
+            $isJoin = false;
+        } elseif ($source instanceof JoinInterface) {
             $tableName = $source->getRight()->getSelectorName();
-            // Special handling of joined select is only needed when doing workspace overlays, which does not happen
-            // in live workspace
-            if ($workspaceUid === 0) {
-                return $this->overlayLanguageAndWorkspaceForSelect($tableName, $rows, $pageRepository, $query, $context);
-            }
-            return $this->overlayLanguageAndWorkspaceForJoinedSelect($tableName, $rows, $pageRepository, $query, $context);
-        }
-        // No proper source, so we do not have a table name here
-        // we cannot do an overlay and return the original rows instead.
-        return $rows;
-    }
-
-    /**
-     * If the result is a plain SELECT (no JOIN) then the regular overlay process works for tables
-     *  - overlay workspace
-     *  - overlay language of versioned record again
-     */
-    protected function overlayLanguageAndWorkspaceForSelect(string $tableName, array $rows, PageRepository $pageRepository, QueryInterface $query, Context $context): array
-    {
-        $limit = 0;
-        $overlaidRows = [];
-        $countOverlaidRows = 0;
-        if ($query->getLimit() && !$context->getAspect('workspace')->isLive()) {
-            $limit = $query->getLimit();
-        }
-
-        foreach ($rows as $row) {
-            $row = $this->overlayLanguageAndWorkspaceForSingleRecord($tableName, $row, $pageRepository, $query);
-            if (is_array($row)) {
-                $overlaidRows[] = $row;
-                $countOverlaidRows++;
-                // We need to calculate the number of overlaid rows manually in PHP
-                // (via the is_array() above), because some overlays do not exist in a Workspace
-                if ($limit === $countOverlaidRows) {
-                    return $overlaidRows;
-                }
-            }
-        }
-        return $overlaidRows;
-    }
-
-    /**
-     * If the result consists of a JOIN (usually happens if a property is a relation with a MM table) then it is necessary
-     * to only do overlays for the fields that are contained in the main database table, otherwise a SQL error is thrown.
-     * In order to make this happen, a single SQL query is made to fetch all possible field names (= array keys) of
-     * a record (TCA[$tableName][columns] does not contain all needed information), which is then used to compute
-     * a separate subset of the row which can be overlaid properly.
-     */
-    protected function overlayLanguageAndWorkspaceForJoinedSelect(string $tableName, array $rows, PageRepository $pageRepository, QueryInterface $query, Context $context): array
-    {
-        // No valid rows, so this is skipped
-        if (!isset($rows[0]['uid'])) {
+            $isJoin = true;
+        } else {
             return $rows;
         }
-
-        $limit = 0;
-        $overlaidRows = [];
-        $countOverlaidRows = 0;
-        if ($query->getLimit() && !$context->getAspect('workspace')->isLive()) {
-            $limit = $query->getLimit();
-        }
-
-        // First, find out the fields that belong to the "main" selected table which is defined by TCA, and take the first
-        // record to find out all possible fields in this database table
-        $fieldsOfMainTable = $pageRepository->getRawRecord($tableName, (int)$rows[0]['uid']);
-        if (is_array($fieldsOfMainTable)) {
-            foreach ($rows as $row) {
-                $mainRow = array_intersect_key($row, $fieldsOfMainTable);
-                $joinRow = array_diff_key($row, $mainRow);
-                $mainRow = $this->overlayLanguageAndWorkspaceForSingleRecord($tableName, $mainRow, $pageRepository, $query);
-                if (is_array($mainRow)) {
-                    $overlaidRows[] = array_replace($joinRow, $mainRow);
-                    $countOverlaidRows++;
-                    // We need to calculate the number of overlaid rows manually in PHP
-                    // (via the is_array() above), because some overlays do not exist in a Workspace
-                    if ($limit === $countOverlaidRows) {
-                        return $overlaidRows;
-                    }
-                }
-            }
-        }
-        return $overlaidRows;
-    }
-
-    /**
-     * Takes one specific row, as defined in TCA and does all overlays.
-     *
-     * @return array|int|mixed|null the overlaid row or false or null if overlay failed.
-     */
-    protected function overlayLanguageAndWorkspaceForSingleRecord(string $tableName, array $row, PageRepository $pageRepository, QueryInterface $query)
-    {
         $querySettings = $query->getQuerySettings();
-        $languageAspect = $querySettings->getLanguageAspect();
-        $languageUid = $languageAspect->getContentId();
-        $schema = $this->tcaSchemaFactory->get($tableName);
-        $languageOfCurrentRecord = 0;
-        $languageField = null;
-        $translationParentPointerField = null;
-        // If current row is a translation select its parent
-        if ($schema->isLanguageAware()) {
-            $languageCapability = $schema->getCapability(TcaSchemaCapability::Language);
-            $languageField = $languageCapability->getLanguageField()->getName();
-            $translationParentPointerField = $languageCapability->getTranslationOriginPointerField()->getName();
-        }
-        if ($languageField && ($row[$languageField] ?? false)) {
-            $languageOfCurrentRecord = $row[$languageField];
-        }
-        // Note #1: In case of ->findByUid([uid-of-translated-record]) the translated record should be fetched at all times
-        // Example: you've fetched a translation directly via findByUid(11) which is a translated record, but the
-        // request was to do overlays. In this case, the default record is loaded again, and then reapplied again.
-        // Note #2: We cannot use $languageAspect->doOverlays() as it also checks for ID > 0
-        $fetchLocalizedRecord = $languageAspect->getOverlayType() !== LanguageAspect::OVERLAYS_OFF;
-        // We have a translated record from the DB, but we do overlays, so let's take the default language record
-        // and do overlays again later-on
-        if ($languageOfCurrentRecord > 0
-            && $fetchLocalizedRecord
-            && ($row[$translationParentPointerField] ?? 0) > 0
-        ) {
-            $row = $pageRepository->getRawRecord(
-                $tableName,
-                (int)$row[$translationParentPointerField]
-            );
-            $languageUid = $languageOfCurrentRecord;
-        }
-
-        // Handle workspace overlays
-        $pageRepository->versionOL($tableName, $row, true, $querySettings->getIgnoreEnableFields());
-        if (is_array($row) && $fetchLocalizedRecord) {
-            if ($tableName === 'pages') {
-                $row = $pageRepository->getLanguageOverlay($tableName, $row);
-            } else {
-                if (!$querySettings->getRespectSysLanguage()
-                    && $languageOfCurrentRecord > 0
-                    && (!$query instanceof Query || !$query->getParentQuery())
-                ) {
-                    // No parent query means we're processing the aggregate root.
-                    // respectSysLanguage is false which means that records returned by the query
-                    // might be from different languages (which is desired).
-                    // So we must set the language used for overlay to the language of the current record
-                    $languageUid = $languageOfCurrentRecord;
-                }
-                if ($translationParentPointerField
-                    && ($row[$translationParentPointerField] ?? 0) > 0
-                    && $languageOfCurrentRecord > 0
-                ) {
-                    // Force overlay by faking default language record, as getRecordOverlay can only handle default language records
-                    $row['uid'] = $row[$translationParentPointerField];
-                    $row[$languageField] = 0;
-                }
-                // The overlay type (and fallback chain) of the language aspect is respected, so translation
-                // behavior is consistent with the regular page / content rendering. The content language
-                // however may have been adjusted above to the language of the actually fetched record
-                // (see Note #1 and the respectSysLanguage handling), so a custom aspect is passed here.
-                $customLanguageAspect = new LanguageAspect(
-                    $languageAspect->getId(),
-                    $languageUid,
-                    $languageAspect->getOverlayType(),
-                    $languageAspect->getFallbackChain()
-                );
-                $row = $pageRepository->getLanguageOverlay($tableName, $row, $customLanguageAspect);
-            }
-        } elseif (is_array($row)) {
-            // If an already localized record is fetched, the "uid" of the default language is used
-            // as the record is re-fetched in the DataMapper
-            if ($translationParentPointerField
-                && ($row[$translationParentPointerField] ?? 0) > 0
-                && $languageOfCurrentRecord > 0
-            ) {
-                $row['_LOCALIZED_UID'] = (int)$row['uid'];
-                $row['uid'] = $row[$translationParentPointerField];
-            }
-        }
-        return $row;
-    }
-
-    /**
-     * Fetches the moved record in case it is supported
-     * by the table and if there's only one row in the result set
-     * (applying this to all rows does not work, since the sorting
-     * order would be destroyed and possible limits are not met anymore)
-     * The move pointers are later unset (see versionOL() last argument)
-     */
-    protected function resolveMovedRecordsInWorkspace(string $tableName, array $rows, int $workspaceUid): array
-    {
-        if ($workspaceUid === 0) {
-            return $rows;
-        }
-        if (!$this->tcaSchemaFactory->has($tableName) || !$this->tcaSchemaFactory->get($tableName)->hasCapability(TcaSchemaCapability::Workspace)) {
-            return $rows;
-        }
-        if (count($rows) !== 1) {
-            return $rows;
-        }
-        $queryBuilder = $this->connectionPool->getQueryBuilderForTable($tableName);
-        $queryBuilder->getRestrictions()->removeAll();
-        $movedRecords = $queryBuilder
-            ->select('*')
-            ->from($tableName)
-            ->where(
-                $queryBuilder->expr()->eq('t3ver_state', $queryBuilder->createNamedParameter(VersionState::MOVE_POINTER->value, Connection::PARAM_INT)),
-                $queryBuilder->expr()->eq('t3ver_wsid', $queryBuilder->createNamedParameter($workspaceUid, Connection::PARAM_INT)),
-                $queryBuilder->expr()->eq('t3ver_oid', $queryBuilder->createNamedParameter($rows[0]['uid'], Connection::PARAM_INT))
-            )
-            ->setMaxResults(1)
-            ->executeQuery()
-            ->fetchAllAssociative();
-        if (!empty($movedRecords)) {
-            $rows = $movedRecords;
-        }
-        return $rows;
+        return $this->rowOverlayService->overlayRows($rows, new OverlayContext(
+            tableName: $tableName,
+            isJoin: $isJoin,
+            languageAspect: $querySettings->getLanguageAspect(),
+            respectSysLanguage: $querySettings->getRespectSysLanguage(),
+            ignoreEnableFields: $querySettings->getIgnoreEnableFields(),
+            enableFieldsToBeIgnored: $querySettings->getEnableFieldsToBeIgnored(),
+            isRootQuery: !$query instanceof Query || !$query->getParentQuery(),
+            limit: (int)$query->getLimit(),
+        ));
     }
 
     protected function addCacheTagsForRows(string $tableName, array $rows): void

@@ -525,8 +525,9 @@ final class BehaviourConformanceTest extends FunctionalTestCase
     // it, because Typo3DbQueryParser::addTypo3Constraints() always adds `t3ver_oid = 0` for
     // workspace-aware tables, filtering row 108 out before PageRepository::versionOL() ever runs.
     // movedRecordIsResolvedWhenFetchedAlone() above already exercises this branch through
-    // findByUid(8), the live uid: Typo3DbBackend::resolveMovedRecordsInWorkspace() re-queries for
-    // the move pointer and feeds it back into versionOL() as $row. No further test is needed here.
+    // findByUid(8), the live uid: RowOverlayService::resolveMovedRecordsInWorkspace() re-queries
+    // for the move pointer and feeds it back into versionOL() as $row. No further test is needed
+    // here.
 
     /**
      * @todo Forge #<T15>: in a workspace count() counts live rows and new versions without the overlay.
