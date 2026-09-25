@@ -33,7 +33,6 @@ use TYPO3\CMS\Core\Database\Query\Expression\ExpressionBuilder;
 use TYPO3\CMS\Core\Database\Query\QueryBuilder;
 use TYPO3\CMS\Core\Domain\Repository\PageRepository;
 use TYPO3\CMS\Core\Http\ApplicationType;
-use TYPO3\CMS\Core\Schema\Capability\RootLevelCapability;
 use TYPO3\CMS\Core\Schema\Capability\TcaSchemaCapability;
 use TYPO3\CMS\Core\Schema\TcaSchemaFactory;
 use TYPO3\CMS\Core\Utility\GeneralUtility;
@@ -65,6 +64,7 @@ use TYPO3\CMS\Extbase\Persistence\Generic\Qom\SourceInterface;
 use TYPO3\CMS\Extbase\Persistence\Generic\Qom\UpperCaseInterface;
 use TYPO3\CMS\Extbase\Persistence\Generic\QuerySettingsInterface;
 use TYPO3\CMS\Extbase\Persistence\Generic\Storage\Exception\BadConstraintException;
+use TYPO3\CMS\Extbase\Persistence\Generic\Storage\Predicate\StoragePagePredicate;
 use TYPO3\CMS\Extbase\Persistence\QueryInterface;
 
 /**
@@ -103,6 +103,7 @@ class Typo3DbQueryParser
         protected readonly TcaSchemaFactory $tcaSchemaFactory,
         protected readonly ConnectionPool $connectionPool,
         protected readonly PageRepository $pageRepository,
+        protected readonly StoragePagePredicate $storagePagePredicate,
     ) {}
 
     /**
@@ -641,7 +642,7 @@ class Typo3DbQueryParser
         }
 
         if ($querySettings->getRespectStoragePage()) {
-            $pageIdStatement = $this->getPageIdStatement($tableName, $tableAlias, $querySettings->getStoragePageIds());
+            $pageIdStatement = $this->storagePagePredicate->build($this->queryBuilder->expr(), $tableName, $tableAlias, $querySettings->getStoragePageIds());
             if (!empty($pageIdStatement)) {
                 $whereClause[] = $pageIdStatement;
             }
@@ -840,52 +841,6 @@ class Typo3DbQueryParser
         }
 
         return $this->queryBuilder->expr()->or(...$andConditions);
-    }
-
-    /**
-     * Builds the page ID checking statement
-     *
-     * @param string $tableName The database table name
-     * @param string $tableAlias The table alias used in the query.
-     * @param array $storagePageIds list of storage page ids
-     * @throws InconsistentQuerySettingsException
-     */
-    protected function getPageIdStatement(string $tableName, string $tableAlias, array $storagePageIds): string
-    {
-        if (!$this->tcaSchemaFactory->has($tableName)) {
-            return '';
-        }
-
-        /** @var RootLevelCapability $rootLevelCapability */
-        $rootLevelCapability = $this->tcaSchemaFactory->get($tableName)->getCapability(TcaSchemaCapability::RestrictionRootLevel);
-        switch ($rootLevelCapability->getRootLevelType()) {
-            // Only in pid 0
-            case RootLevelCapability::TYPE_ONLY_ON_ROOTLEVEL:
-                $storagePageIds = [0];
-                break;
-                // Pid 0 and pagetree
-            case RootLevelCapability::TYPE_BOTH:
-                if ($storagePageIds === []) {
-                    $storagePageIds = [0];
-                } else {
-                    $storagePageIds[] = 0;
-                }
-                break;
-                // Only pagetree or not set
-            case RootLevelCapability::TYPE_ONLY_ON_PAGES:
-                if (empty($storagePageIds)) {
-                    throw new InconsistentQuerySettingsException('Missing storage page ids.', 1365779762);
-                }
-                break;
-                // Invalid configuration
-            default:
-                return '';
-        }
-        $storagePageIds = array_map(intval(...), $storagePageIds);
-        if (count($storagePageIds) === 1) {
-            return $this->queryBuilder->expr()->eq($tableAlias . '.pid', reset($storagePageIds));
-        }
-        return $this->queryBuilder->expr()->in($tableAlias . '.pid', $storagePageIds);
     }
 
     /**
