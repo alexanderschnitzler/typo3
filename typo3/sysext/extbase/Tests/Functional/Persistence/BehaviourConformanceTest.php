@@ -32,7 +32,11 @@ use TYPO3\CMS\Extbase\DomainObject\AbstractDomainObject;
 use TYPO3\CMS\Extbase\DomainObject\DomainObjectInterface;
 use TYPO3\CMS\Extbase\Event\Persistence\ModifyQueryBeforeFetchingObjectDataEvent;
 use TYPO3\CMS\Extbase\Event\Persistence\ModifyResultAfterFetchingObjectDataEvent;
+use TYPO3\CMS\Extbase\Persistence\Generic\Exception as GenericPersistenceException;
 use TYPO3\CMS\Extbase\Persistence\Generic\PersistenceManager;
+use TYPO3\CMS\Extbase\Persistence\Generic\Qom\QueryObjectModelFactory;
+use TYPO3\CMS\Extbase\Persistence\Generic\Query;
+use TYPO3\CMS\Extbase\Persistence\Generic\Storage\Exception\BadConstraintException;
 use TYPO3\CMS\Extbase\Persistence\QueryInterface;
 use TYPO3\CMS\Extbase\Property\PropertyMapper;
 use TYPO3\TestingFramework\Core\Functional\FunctionalTestCase;
@@ -761,5 +765,124 @@ final class BehaviourConformanceTest extends FunctionalTestCase
         foreach (array_chunk($order, 2) as $pair) {
             self::assertSame(['before', 'after'], $pair);
         }
+    }
+
+    /**
+     * Query::statement() with a raw SQL string hydrates managed, identity-mapped objects,
+     * bypassing QOM entirely.
+     */
+    #[Test]
+    public function rawSqlStatementHydratesManagedObjects(): void
+    {
+        $query = $this->get(PostRepository::class)->createQuery();
+        self::assertInstanceOf(Query::class, $query);
+        $query->statement('SELECT * FROM tx_blogexample_domain_model_post WHERE uid = ?', [1]);
+        $result = $query->execute();
+        self::assertSame('P1|1|1|0', self::describe($result->getFirst()));
+    }
+
+    /**
+     * Query::statement() also accepts a pre-built QueryBuilder, executed as-is by
+     * getObjectDataByRawQuery().
+     */
+    #[Test]
+    public function rawQueryBuilderStatementHydratesManagedObjects(): void
+    {
+        $queryBuilder = $this->get(ConnectionPool::class)->getQueryBuilderForTable('tx_blogexample_domain_model_post');
+        $queryBuilder->select('*')->from('tx_blogexample_domain_model_post')
+            ->where($queryBuilder->expr()->eq('uid', $queryBuilder->createNamedParameter(1)));
+        $query = $this->get(PostRepository::class)->createQuery();
+        self::assertInstanceOf(Query::class, $query);
+        $query->statement($queryBuilder);
+        $result = $query->execute();
+        self::assertSame('P1|1|1|0', self::describe($result->getFirst()));
+    }
+
+    /**
+     * The IN operator rejects an empty value list instead of building `IN ()`.
+     */
+    #[Test]
+    public function inOperatorWithEmptyListThrowsBadConstraintException(): void
+    {
+        $this->expectException(BadConstraintException::class);
+        $this->expectExceptionCode(1484828466);
+        $query = $this->get(PostRepository::class)->createQuery();
+        $query->matching($query->in('uid', []));
+        // execute() alone returns a lazy QueryResult; force the SQL to be built.
+        $query->execute(true);
+    }
+
+    /**
+     * OPERATOR_NOT_EQUAL_TO (with and without a null operand) is only reachable through the
+     * QOM factory directly, Query has no fluent "notEquals"/"notEqualToNull" method.
+     */
+    #[Test]
+    public function notEqualToOperatorViaQomFactoryExcludesMatchingRow(): void
+    {
+        $qomFactory = $this->get(QueryObjectModelFactory::class);
+        $query = $this->get(PostRepository::class)->createQuery();
+        $tableName = 'tx_blogexample_domain_model_post';
+        $query->matching(
+            $qomFactory->comparison($qomFactory->propertyValue('title', $tableName), QueryInterface::OPERATOR_NOT_EQUAL_TO, 'P1')
+        );
+        self::assertNotContains('P1|1|1|0', self::describeAll($query->execute()));
+    }
+
+    /**
+     * An operator outside QueryInterface::OPERATOR_* throws, only reachable through the QOM
+     * factory directly since Query's fluent methods never pass an arbitrary int.
+     */
+    #[Test]
+    public function unsupportedOperatorViaQomFactoryThrowsException(): void
+    {
+        $this->expectException(GenericPersistenceException::class);
+        $this->expectExceptionCode(1242816073);
+        $qomFactory = $this->get(QueryObjectModelFactory::class);
+        $query = $this->get(PostRepository::class)->createQuery();
+        $tableName = 'tx_blogexample_domain_model_post';
+        $query->matching($qomFactory->comparison($qomFactory->propertyValue('title', $tableName), 99999, 'P1')); // @phpstan-ignore argument.type (intentionally passing an unsupported operator to test error handling)
+        $query->execute(true);
+    }
+
+    /**
+     * A non-empty `enableFieldsToBeIgnored` only bypasses the named fields, unlike the empty
+     * (ignore-everything) list used by ignoredEnableFieldsAlsoApplyToTranslationLookup(). Only
+     * "hidden" is named here, so the hidden P5 DA translation is now returned by name, without
+     * changing anything else about the default OVERLAYS_OFF result set.
+     */
+    #[Test]
+    public function enableFieldsToBeIgnoredWithPartialListOnlyBypassesNamedField(): void
+    {
+        $languageAspect = $this->setLanguage(1, LanguageAspect::OVERLAYS_OFF);
+        $query = $this->createPostQuery($languageAspect);
+        $query->getQuerySettings()->setIgnoreEnableFields(true);
+        $query->getQuerySettings()->setEnableFieldsToBeIgnored(['disabled']);
+        self::assertSame(
+            ['P4 all languages|4|4|-1', 'P16 floating DA|16|16|1', 'P5 DA hidden|5|15|1', 'P3 DA|3|13|1', 'P2 DA|2|11|1'],
+            self::describeAll($query->execute())
+        );
+    }
+
+    /**
+     * A soft-deleted row is excluded by default and returned when `includeDeleted` is set
+     * (which requires `ignoreEnableFields` too in frontend context, see
+     * Typo3DbQueryParser::getFrontendConstraintStatement()).
+     */
+    #[Test]
+    public function includeDeletedReturnsSoftDeletedRows(): void
+    {
+        $postRepository = $this->get(PostRepository::class);
+        $post = $postRepository->findByUid(1);
+        $postRepository->remove($post);
+        $this->get(PersistenceManager::class)->persistAll();
+
+        $languageAspect = $this->setLanguage(0, LanguageAspect::OVERLAYS_ON);
+        $defaultQuery = $this->createPostQuery($languageAspect);
+        self::assertNotContains('P1|1|1|0', self::describeAll($defaultQuery->execute()));
+
+        $includeDeletedQuery = $this->createPostQuery($languageAspect);
+        $includeDeletedQuery->getQuerySettings()->setIgnoreEnableFields(true);
+        $includeDeletedQuery->getQuerySettings()->setIncludeDeleted(true);
+        self::assertContains('P1|1|1|0', self::describeAll($includeDeletedQuery->execute()));
     }
 }
