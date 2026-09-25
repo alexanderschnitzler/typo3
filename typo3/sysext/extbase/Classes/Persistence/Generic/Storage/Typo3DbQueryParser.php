@@ -23,14 +23,12 @@ use Doctrine\DBAL\Platforms\PostgreSQLPlatform;
 use Doctrine\DBAL\Types\Type;
 use Psr\Http\Message\ServerRequestInterface;
 use Symfony\Component\DependencyInjection\Attribute\Autoconfigure;
-use TYPO3\CMS\Core\Context\LanguageAspect;
 use TYPO3\CMS\Core\Database\Connection;
 use TYPO3\CMS\Core\Database\ConnectionPool;
 use TYPO3\CMS\Core\Database\Query\Expression\CompositeExpression;
 use TYPO3\CMS\Core\Database\Query\Expression\ExpressionBuilder;
 use TYPO3\CMS\Core\Database\Query\QueryBuilder;
 use TYPO3\CMS\Core\Http\ApplicationType;
-use TYPO3\CMS\Core\Schema\Capability\TcaSchemaCapability;
 use TYPO3\CMS\Core\Schema\TcaSchemaFactory;
 use TYPO3\CMS\Extbase\DomainObject\AbstractDomainObject;
 use TYPO3\CMS\Extbase\DomainObject\DomainObjectInterface;
@@ -59,6 +57,7 @@ use TYPO3\CMS\Extbase\Persistence\Generic\Qom\SourceInterface;
 use TYPO3\CMS\Extbase\Persistence\Generic\Qom\UpperCaseInterface;
 use TYPO3\CMS\Extbase\Persistence\Generic\QuerySettingsInterface;
 use TYPO3\CMS\Extbase\Persistence\Generic\Storage\Exception\BadConstraintException;
+use TYPO3\CMS\Extbase\Persistence\Generic\Storage\Predicate\LanguagePredicate;
 use TYPO3\CMS\Extbase\Persistence\Generic\Storage\Predicate\StoragePagePredicate;
 use TYPO3\CMS\Extbase\Persistence\Generic\Storage\Predicate\VisibilityPredicate;
 use TYPO3\CMS\Extbase\Persistence\QueryInterface;
@@ -100,6 +99,7 @@ class Typo3DbQueryParser
         protected readonly ConnectionPool $connectionPool,
         protected readonly StoragePagePredicate $storagePagePredicate,
         protected readonly VisibilityPredicate $visibilityPredicate,
+        protected readonly LanguagePredicate $languagePredicate,
     ) {}
 
     /**
@@ -631,7 +631,13 @@ class Typo3DbQueryParser
     {
         $whereClause = [];
         if ($querySettings->getRespectSysLanguage()) {
-            $systemLanguageStatement = $this->getLanguageStatement($tableName, $tableAlias, $querySettings);
+            $systemLanguageStatement = $this->languagePredicate->build(
+                $this->queryBuilder,
+                $tableName,
+                $tableAlias,
+                $querySettings,
+                fn(string $alias): string => $this->getVisibilityConstraintStatement($querySettings, $tableName, $alias),
+            );
             if (!empty($systemLanguageStatement)) {
                 $whereClause[] = $systemLanguageStatement;
             }
@@ -666,108 +672,6 @@ class Typo3DbQueryParser
     {
         return ($GLOBALS['TYPO3_REQUEST'] ?? null) instanceof ServerRequestInterface
             && ApplicationType::fromRequest($GLOBALS['TYPO3_REQUEST'])->isFrontend();
-    }
-
-    /**
-     * Builds the language field statement
-     *
-     * @param string $tableName The database table name
-     * @param string $tableAlias The table alias used in the query.
-     * @param QuerySettingsInterface $querySettings The TYPO3 CMS specific query settings
-     * @return CompositeExpression|string
-     */
-    protected function getLanguageStatement(string $tableName, string $tableAlias, QuerySettingsInterface $querySettings)
-    {
-        if (!$this->tcaSchemaFactory->has($tableName)) {
-            return '';
-        }
-        $schema = $this->tcaSchemaFactory->get($tableName);
-        if (!$schema->isLanguageAware()) {
-            return '';
-        }
-        $languageCapability = $schema->getCapability(TcaSchemaCapability::Language);
-
-        // Select all entries for the current language
-        // If any language is set -> get those entries which are not translated yet
-        // They will be removed by \TYPO3\CMS\Core\Domain\Repository\PageRepository::getRecordOverlay if not matching overlay mode
-        $languageField = $languageCapability->getLanguageField()->getName();
-        $transOrigPointerField = $languageCapability->getTranslationOriginPointerField()->getName();
-
-        $languageAspect = $querySettings->getLanguageAspect();
-        if (!$languageAspect->getContentId()) {
-            return $this->queryBuilder->expr()->in(
-                $tableAlias . '.' . $languageField,
-                [$languageAspect->getContentId(), -1]
-            );
-        }
-
-        if (!$languageAspect->doOverlays()) {
-            return $this->queryBuilder->expr()->in(
-                $tableAlias . '.' . $languageField,
-                [$languageAspect->getContentId(), -1]
-            );
-        }
-
-        $defLangTableAlias = $tableAlias . '_dl';
-        $defaultLanguageRecordsSubSelect = $this->queryBuilder->getConnection()->createQueryBuilder();
-        $defaultLanguageRecordsSubSelect->getRestrictions()->removeAll();
-        $defaultLanguageRecordsSubSelect
-            ->select($defLangTableAlias . '.uid')
-            ->from($tableName, $defLangTableAlias)
-            ->where(
-                $defaultLanguageRecordsSubSelect->expr()->eq($defLangTableAlias . '.' . $transOrigPointerField, 0),
-                $defaultLanguageRecordsSubSelect->expr()->eq($defLangTableAlias . '.' . $languageField, 0),
-                $this->getVisibilityConstraintStatement($querySettings, $tableName, $defLangTableAlias)
-            );
-
-        $andConditions = [];
-        // records in language 'all'
-        $andConditions[] = $this->queryBuilder->expr()->eq($tableAlias . '.' . $languageField, -1);
-        // translated records where a default language exists
-        $andConditions[] = $this->queryBuilder->expr()->and(
-            $this->queryBuilder->expr()->eq($tableAlias . '.' . $languageField, $languageAspect->getContentId()),
-            $this->queryBuilder->expr()->in(
-                $tableAlias . '.' . $transOrigPointerField,
-                $defaultLanguageRecordsSubSelect->getSQL()
-            )
-        );
-        // Records in translation with no default language
-        if ($languageAspect->getOverlayType() === LanguageAspect::OVERLAYS_ON_WITH_FLOATING) {
-            $andConditions[] = $this->queryBuilder->expr()->and(
-                $this->queryBuilder->expr()->eq($tableAlias . '.' . $languageField, $languageAspect->getContentId()),
-                $this->queryBuilder->expr()->eq($tableAlias . '.' . $transOrigPointerField, 0),
-                $this->queryBuilder->expr()->notIn(
-                    $tableAlias . '.' . $transOrigPointerField,
-                    $defaultLanguageRecordsSubSelect->getSQL()
-                )
-            );
-        }
-        if ($languageAspect->getOverlayType() === LanguageAspect::OVERLAYS_MIXED) {
-            // returns records from current language which have a default language
-            // together with not translated default language records
-            $translatedOnlyTableAlias = $tableAlias . '_to';
-            $queryBuilderForSubselect = $this->queryBuilder->getConnection()->createQueryBuilder();
-            $queryBuilderForSubselect->getRestrictions()->removeAll();
-            $queryBuilderForSubselect
-                ->select($translatedOnlyTableAlias . '.' . $transOrigPointerField)
-                ->from($tableName, $translatedOnlyTableAlias)
-                ->where(
-                    $queryBuilderForSubselect->expr()->gt($translatedOnlyTableAlias . '.' . $transOrigPointerField, 0),
-                    $queryBuilderForSubselect->expr()->eq($translatedOnlyTableAlias . '.' . $languageField, $languageAspect->getContentId()),
-                    //  The records in default language should also respect the visibility constraints
-                    $this->getVisibilityConstraintStatement($querySettings, $tableName, $translatedOnlyTableAlias)
-                );
-            // records in default language, which do not have a translation
-            $andConditions[] = $this->queryBuilder->expr()->and(
-                $this->queryBuilder->expr()->eq($tableAlias . '.' . $languageField, 0),
-                $this->queryBuilder->expr()->notIn(
-                    $tableAlias . '.uid',
-                    $queryBuilderForSubselect->getSQL()
-                )
-            );
-        }
-
-        return $this->queryBuilder->expr()->or(...$andConditions);
     }
 
     /**
